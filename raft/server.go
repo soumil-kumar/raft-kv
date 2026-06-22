@@ -1,22 +1,92 @@
 package raft
 
 import (
-	"log"
 	"net"
 	"net/rpc"
+	"sync"
 	"time"
 )
 
-type Server struct {
-	addr     string
-	rpcSrv   *rpc.Server
-	listener net.Listener
+type NetworkTransport interface {
+	Call(peerAddr string, rpcname string, args interface{}, reply interface{}) bool
 }
 
-func NewServer(addr string) *Server {
+type RealTransport struct {
+	mu      sync.Mutex
+	clients map[string]*rpc.Client
+}
+
+func NewRealTransport() *RealTransport {
+	return &RealTransport{
+		clients: make(map[string]*rpc.Client),
+	}
+}
+
+func (t *RealTransport) getClient(peerAddr string) (*rpc.Client, error) {
+	t.mu.Lock()
+	client, ok := t.clients[peerAddr]
+	t.mu.Unlock()
+
+	if ok && client != nil {
+		return client, nil
+	}
+
+	conn, err := net.DialTimeout("tcp", peerAddr, 1000*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	
+	newClient := rpc.NewClient(conn)
+	t.mu.Lock()
+	t.clients[peerAddr] = newClient
+	t.mu.Unlock()
+	return newClient, nil
+}
+
+func (t *RealTransport) removeClient(peerAddr string, client *rpc.Client) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.clients[peerAddr] == client {
+		delete(t.clients, peerAddr)
+		client.Close()
+	}
+}
+
+func (t *RealTransport) Call(peerAddr string, rpcname string, args interface{}, reply interface{}) bool {
+	client, err := t.getClient(peerAddr)
+	if err != nil {
+		return false
+	}
+	
+	call := client.Go(rpcname, args, reply, nil)
+	select {
+	case <-call.Done:
+		if call.Error != nil {
+			t.removeClient(peerAddr, client)
+			return false
+		}
+		return true
+	case <-time.After(1000 * time.Millisecond): // RPC timeout
+		t.removeClient(peerAddr, client)
+		return false
+	}
+}
+
+type Server struct {
+	addr      string
+	rpcSrv    *rpc.Server
+	listener  net.Listener
+	transport NetworkTransport
+}
+
+func NewServer(addr string, transport NetworkTransport) *Server {
+	if transport == nil {
+		transport = NewRealTransport()
+	}
 	return &Server{
-		addr:   addr,
-		rpcSrv: rpc.NewServer(),
+		addr:      addr,
+		rpcSrv:    rpc.NewServer(),
+		transport: transport,
 	}
 }
 
@@ -32,7 +102,7 @@ func (s *Server) Start(raft *Raft) error {
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
-				log.Printf("RPC accept error: %v", err)
+				// Listener closed
 				return
 			}
 			go s.rpcSrv.ServeConn(conn)
@@ -42,24 +112,5 @@ func (s *Server) Start(raft *Raft) error {
 }
 
 func (s *Server) Call(peerAddr string, rpcname string, args interface{}, reply interface{}) bool {
-	// Setup connection with a timeout
-	conn, err := net.DialTimeout("tcp", peerAddr, 50*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	
-	client := rpc.NewClient(conn)
-	defer client.Close()
-	
-	call := client.Go(rpcname, args, reply, nil)
-	select {
-	case <-call.Done:
-		if call.Error != nil {
-			return false
-		}
-		return true
-	case <-time.After(100 * time.Millisecond): // RPC timeout
-		return false
-	}
+	return s.transport.Call(peerAddr, rpcname, args, reply)
 }
