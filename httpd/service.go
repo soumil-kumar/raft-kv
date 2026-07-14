@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,11 +92,7 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request, key string) 
 	val, ok, err := s.store.Get(key, consistent)
 	if err != nil {
 		if err == store.ErrNotLeader {
-			// For consistent reads, we need the leader.
-			// Redirect to the leader or return an error with leader address.
-			leaderAddr := s.store.LeaderAddr()
-			httpError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("not the leader, leader is at %s", leaderAddr))
+			httpError(w, http.StatusServiceUnavailable, "consistent read requires leader")
 			return
 		}
 		httpError(w, http.StatusInternalServerError, err.Error())
@@ -129,7 +126,11 @@ func (s *Service) handleSet(w http.ResponseWriter, r *http.Request, key string) 
 		return
 	}
 
-	err = s.store.Set(key, body.Value)
+	clientID := r.Header.Get("X-Client-Id")
+	seqNumStr := r.Header.Get("X-Sequence-Num")
+	seqNum, _ := strconv.Atoi(seqNumStr)
+
+	err = s.store.Set(key, body.Value, clientID, seqNum)
 	if err != nil {
 		if err == store.ErrNotLeader {
 			// Recreate the body for forwarding
@@ -151,7 +152,11 @@ func (s *Service) handleSet(w http.ResponseWriter, r *http.Request, key string) 
 // handleDelete removes a key from the store.
 // Like handleSet, forwards to the leader if this node is not the leader.
 func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
-	err := s.store.Delete(key)
+	clientID := r.Header.Get("X-Client-Id")
+	seqNumStr := r.Header.Get("X-Sequence-Num")
+	seqNum, _ := strconv.Atoi(seqNumStr)
+
+	err := s.store.Delete(key, clientID, seqNum)
 	if err != nil {
 		if err == store.ErrNotLeader {
 			s.forwardToLeader(w, r)
@@ -196,33 +201,27 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 // in the cluster and the system "just works." This is the same pattern used
 // by production systems like HashiCorp Consul and etcd.
 func (s *Service) forwardToLeader(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Forwarded-For-Raft") == "true" {
+		httpError(w, http.StatusServiceUnavailable, "proxy loop detected")
+		return
+	}
+
 	leaderAddr := s.store.LeaderAddr()
 	if leaderAddr == "" {
 		httpError(w, http.StatusServiceUnavailable, "no leader elected yet, try again shortly")
 		return
 	}
 
-	// The leader's Raft address is in the format "host:raftPort".
-	// We need to map it to the HTTP address. Convention: HTTP port = Raft port - 1000.
-	// e.g., Raft :9001 → HTTP :8001
-	leaderHost, leaderPort, err := net.SplitHostPort(leaderAddr)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "failed to parse leader address")
+	leaderHttpAddr := s.store.LeaderHTTPAddr()
+	if leaderHttpAddr == "" {
+		httpError(w, http.StatusInternalServerError, "failed to parse leader HTTP address")
 		return
 	}
 
-	// Convert raft port to HTTP port (raft port - 1000)
-	var raftPort int
-	fmt.Sscanf(leaderPort, "%d", &raftPort)
-	httpPort := raftPort - 1000
+	// We format targetURL with the leader's HTTP address and the original RequestURI (which includes query params)
+	targetURL := fmt.Sprintf("http://%s%s", leaderHttpAddr, r.URL.RequestURI())
 
-	if leaderHost == "" {
-		leaderHost = "127.0.0.1"
-	}
-
-	targetURL := fmt.Sprintf("http://%s:%d%s", leaderHost, httpPort, r.URL.Path)
-
-	log.Printf("[httpd] forwarding %s %s to leader at %s", r.Method, r.URL.Path, targetURL)
+	log.Printf("[httpd] forwarding %s %s to leader at %s", r.Method, r.URL.RequestURI(), targetURL)
 
 	// Create a new request to the leader
 	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
@@ -231,6 +230,7 @@ func (s *Service) forwardToLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyReq.Header = r.Header
+	proxyReq.Header.Set("X-Forwarded-For-Raft", "true")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(proxyReq)
