@@ -19,6 +19,7 @@ func main() {
 	httpAddr := flag.String("http-addr", ":8001", "HTTP API bind address")
 	raftAddr := flag.String("raft-addr", ":9001", "Raft inter-node communication address")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer Raft addresses (e.g. localhost:9002,localhost:9003)")
+	peerHttpAddrsFlag := flag.String("peer-http", "", "Comma-separated list of peer HTTP addresses (e.g. localhost:8002,localhost:8003)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `
@@ -60,6 +61,32 @@ Flags:
 		peers = append(peers, *raftAddr)
 	}
 
+	// Parse HTTP map
+	httpMap := make(map[string]string)
+	peerHttps := []string{}
+	if *peerHttpAddrsFlag != "" {
+		peerHttps = strings.Split(*peerHttpAddrsFlag, ",")
+	}
+	
+	// Map provided HTTP addrs
+	if len(peers) > 0 && len(peers) == len(peerHttps) {
+		for i, p := range peers {
+			httpMap[p] = peerHttps[i]
+		}
+	} else {
+		// Fallback to convention if flag not provided (for older scripts)
+		for _, p := range peers {
+			parts := strings.Split(p, ":")
+			if len(parts) == 2 {
+				var rPort int
+				fmt.Sscanf(parts[1], "%d", &rPort)
+				httpMap[p] = fmt.Sprintf("%s:%d", parts[0], rPort-1000)
+			} else {
+				httpMap[p] = p // fallback
+			}
+		}
+	}
+
 	log.Printf("=========================================")
 	log.Printf("  raft-kv starting up")
 	log.Printf("  Node ID:    %s", *nodeID)
@@ -69,7 +96,7 @@ Flags:
 	log.Printf("=========================================")
 
 	// --- Initialize the store ---
-	s := store.New(*nodeID, *raftAddr, peers)
+	s := store.New(*nodeID, *raftAddr, peers, httpMap)
 
 	if err := s.Open(); err != nil {
 		log.Fatalf("Failed to open store: %v", err)
