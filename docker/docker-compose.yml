@@ -10,7 +10,8 @@ services:
       --node-id=node1
       --http-addr=:8001
       --raft-addr=:9001
-      --data-dir=/data
+      --peers=node1:9001,node2:9002,node3:9003
+      --peer-http=node1:8001,node2:8002,node3:8003
     ports:
       - "8001:8001"
       - "9001:9001"
@@ -33,8 +34,8 @@ services:
       --node-id=node2
       --http-addr=:8002
       --raft-addr=:9002
-      --data-dir=/data
-      --join=node1:8001
+      --peers=node1:9001,node2:9002,node3:9003
+      --peer-http=node1:8001,node2:8002,node3:8003
     ports:
       - "8002:8002"
       - "9002:9002"
@@ -55,8 +56,8 @@ services:
       --node-id=node3
       --http-addr=:8003
       --raft-addr=:9003
-      --data-dir=/data
-      --join=node1:8001
+      --peers=node1:9001,node2:9002,node3:9003
+      --peer-http=node1:8001,node2:8002,node3:8003
     ports:
       - "8003:8003"
       - "9003:9003"
