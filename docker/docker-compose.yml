@@ -1,0 +1,78 @@
+version: "3.8"
+
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: raft-kv-node1
+    command: >
+      --node-id=node1
+      --http-addr=:8001
+      --raft-addr=:9001
+      --data-dir=/data
+    ports:
+      - "8001:8001"
+      - "9001:9001"
+    volumes:
+      - node1-data:/data
+    networks:
+      - raft-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/status"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: raft-kv-node2
+    command: >
+      --node-id=node2
+      --http-addr=:8002
+      --raft-addr=:9002
+      --data-dir=/data
+      --join=node1:8001
+    ports:
+      - "8002:8002"
+      - "9002:9002"
+    volumes:
+      - node2-data:/data
+    networks:
+      - raft-net
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: raft-kv-node3
+    command: >
+      --node-id=node3
+      --http-addr=:8003
+      --raft-addr=:9003
+      --data-dir=/data
+      --join=node1:8001
+    ports:
+      - "8003:8003"
+      - "9003:9003"
+    volumes:
+      - node3-data:/data
+    networks:
+      - raft-net
+    depends_on:
+      node1:
+        condition: service_healthy
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  raft-net:
+    driver: bridge
