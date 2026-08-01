@@ -113,23 +113,29 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request, key string) 
 	})
 }
 
-// handleSet stores a key-value pair.
-// If this node is not the leader, the request is transparently forwarded
-// to the current leader — the client doesn't need to know who the leader is.
 func (s *Service) handleSet(w http.ResponseWriter, r *http.Request, key string) {
-	// Parse the request body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read body")
+		return
+	}
+	r.Body.Close()
+
 	var body struct {
 		Value string `json:"value"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		httpError(w, http.StatusBadRequest, "invalid JSON body, expected {\"value\": \"...\"}")
 		return
 	}
 
-	err := s.store.Set(key, body.Value)
+	err = s.store.Set(key, body.Value)
 	if err != nil {
 		if err == store.ErrNotLeader {
-			// Forward the request to the leader
+			importBytes := "bytes"
+			_ = importBytes
+			// Recreate the body for forwarding
+			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 			s.forwardToLeader(w, r)
 			return
 		}

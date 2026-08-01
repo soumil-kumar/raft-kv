@@ -36,6 +36,7 @@ type Raft struct {
 
 	// Volatile state
 	state       State
+	leaderId    string
 	commitIndex int
 	lastApplied int
 
@@ -94,11 +95,7 @@ func (r *Raft) IsLeader() bool {
 func (r *Raft) GetLeaderID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state == Leader {
-		return r.me
-	}
-	// In a real implementation we might track the last known leader from AppendEntries
-	return ""
+	return r.leaderId
 }
 
 func (r *Raft) ticker() {
@@ -128,6 +125,7 @@ func (r *Raft) startElection() {
 	r.state = Candidate
 	r.currentTerm++
 	r.votedFor = r.me
+	r.leaderId = ""
 	r.persist()
 	r.resetElectionTimer()
 
@@ -166,7 +164,7 @@ func (r *Raft) startElection() {
 			}
 			if reply.VoteGranted {
 				votes++
-				if votes > (len(r.peers)+1)/2 {
+				if votes > len(r.peers)/2 {
 					r.becomeLeader()
 				}
 			}
@@ -178,12 +176,14 @@ func (r *Raft) becomeFollower(term int) {
 	r.state = Follower
 	r.currentTerm = term
 	r.votedFor = ""
+	r.leaderId = ""
 	r.persist()
 	r.resetElectionTimer()
 }
 
 func (r *Raft) becomeLeader() {
 	r.state = Leader
+	r.leaderId = r.me
 	log.Printf("[%s] Became leader for term %d", r.me, r.currentTerm)
 	r.nextIndex = make(map[string]int)
 	r.matchIndex = make(map[string]int)
@@ -265,7 +265,7 @@ func (r *Raft) sendAppendEntriesToPeer(peer string) {
 						matchCount++
 					}
 				}
-				if matchCount > (len(r.peers)+1)/2 {
+				if matchCount > len(r.peers)/2 {
 					r.commitIndex = i
 					r.applyCond.Broadcast()
 					break

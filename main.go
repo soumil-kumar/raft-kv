@@ -9,8 +9,8 @@ import (
 	"strings"
 	"syscall"
 
-	"raft-kv/httpd"
-	"raft-kv/store"
+	"github.com/raft-kv/httpd"
+	"github.com/raft-kv/store"
 )
 
 func main() {
@@ -48,7 +48,17 @@ Flags:
 	if *peersFlag != "" {
 		peers = strings.Split(*peersFlag, ",")
 	}
-	peers = append(peers, *raftAddr) // Include self in peers for simplicity
+	
+	// Ensure self is in peers if not already
+	found := false
+	for _, p := range peers {
+		if p == *raftAddr {
+			found = true
+		}
+	}
+	if !found {
+		peers = append(peers, *raftAddr)
+	}
 
 	log.Printf("=========================================")
 	log.Printf("  raft-kv starting up")

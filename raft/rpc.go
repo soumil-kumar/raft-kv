@@ -74,10 +74,12 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) 
 	}
 
 	r.resetElectionTimer()
+	r.leaderId = args.LeaderId
 
 	// If we are candidate and receive AppendEntries from a valid leader, become follower
 	if r.state == Candidate {
 		r.becomeFollower(args.Term)
+		r.leaderId = args.LeaderId
 	}
 
 	if args.PrevLogIndex > 0 {
