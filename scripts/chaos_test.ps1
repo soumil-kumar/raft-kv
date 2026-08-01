@@ -38,20 +38,38 @@ try {
     # PHASE 1: Start a 3-node cluster
     # ============================================================
     Write-Step "Starting node1 (bootstrap leader)..."
-    $node1 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node1", "--http-addr=:8001", "--raft-addr=:9001" -PassThru -WindowStyle Hidden
+    $node1 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node1", "--http-addr=:8001", "--raft-addr=:9001", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 4
 
     Write-Step "Starting node2 (joining cluster)..."
-    $node2 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node2", "--http-addr=:8002", "--raft-addr=:9002", "--join=localhost:8001" -PassThru -WindowStyle Hidden
+    $node2 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node2", "--http-addr=:8002", "--raft-addr=:9002", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 3
 
     Write-Step "Starting node3 (joining cluster)..."
-    $node3 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node3", "--http-addr=:8003", "--raft-addr=:9003", "--join=localhost:8001" -PassThru -WindowStyle Hidden
+    $node3 = Start-Process -FilePath $Binary -ArgumentList "--node-id=node3", "--http-addr=:8003", "--raft-addr=:9003", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 3
 
     Write-Host ""
-    Write-Host "Cluster started: node1 (leader), node2, node3" -ForegroundColor Cyan
+    Write-Host "Cluster started: node1, node2, node3" -ForegroundColor Cyan
     Write-Host ""
+
+    # Find the true leader
+    $leaderPort = $null
+    foreach ($port in @(8001, 8002, 8003)) {
+        try {
+            $status = Invoke-RestMethod -Uri "http://localhost:$port/status" -Method Get -ErrorAction Stop
+            if ($status.is_leader -eq $true) {
+                $leaderPort = $port
+                break
+            }
+        } catch { }
+    }
+    
+    if (-not $leaderPort) {
+        Write-Fail "Could not find initial leader!"
+        exit 1
+    }
+    Write-Pass "Found initial leader on port $leaderPort"
 
     # ============================================================
     # PHASE 2: Write test data to the leader
@@ -67,7 +85,7 @@ try {
     foreach ($key in $testData.Keys) {
         $value = $testData[$key]
         $body = @{ value = $value } | ConvertTo-Json
-        $response = Invoke-RestMethod -Uri "http://localhost:8001/store/$key" -Method Put -Body $body -ContentType "application/json"
+        $response = Invoke-RestMethod -Uri "http://localhost:$leaderPort/store/$key" -Method Put -Body $body -ContentType "application/json"
         Write-Host "  SET $key = $value -> $($response.status)" -ForegroundColor DarkGray
     }
     Write-Pass "All test data written successfully"
@@ -107,11 +125,17 @@ try {
     # PHASE 4: Kill the leader!
     # ============================================================
     Write-Host ""
-    Write-Host "  killing the leader (node1)!" -ForegroundColor Red
+    Write-Host "  killing the leader (port $leaderPort)!" -ForegroundColor Red
     Write-Host ""
     
-    Stop-Process -Id $node1.Id -Force
-    Write-Step "Node1 killed. Waiting for re-election..."
+    $processes = @{
+        "8001" = $node1
+        "8002" = $node2
+        "8003" = $node3
+    }
+    $leaderProc = $processes["$leaderPort"]
+    Stop-Process -Id $leaderProc.Id -Force
+    Write-Step "Leader on port $leaderPort killed. Waiting for re-election..."
     Start-Sleep -Seconds 5
 
     # ============================================================
@@ -120,7 +144,9 @@ try {
     Write-Step "Checking for new leader..."
     $newLeaderFound = $false
     
-    foreach ($port in @(8002, 8003)) {
+    $survivingPorts = @(8001, 8002, 8003) | Where-Object { $_ -ne $leaderPort }
+
+    foreach ($port in $survivingPorts) {
         try {
             $status = Invoke-RestMethod -Uri "http://localhost:$port/status" -Method Get
             if ($status.is_leader -eq $true) {
@@ -143,7 +169,7 @@ try {
     Write-Step "Verifying data survived leader failure..."
     
     $dataSurvived = $true
-    foreach ($port in @(8002, 8003)) {
+    foreach ($port in $survivingPorts) {
         foreach ($key in $testData.Keys) {
             try {
                 $response = Invoke-RestMethod -Uri "http://localhost:$port/store/$key" -Method Get
@@ -172,7 +198,7 @@ try {
     Write-Step "Writing new data to surviving cluster..."
     
     $writeSuccess = $false
-    foreach ($port in @(8002, 8003)) {
+    foreach ($port in $survivingPorts) {
         try {
             $body = @{ value = "survives" } | ConvertTo-Json
             $response = Invoke-RestMethod -Uri "http://localhost:$port/store/chaos_test" -Method Put -Body $body -ContentType "application/json"
