@@ -132,8 +132,6 @@ func (s *Service) handleSet(w http.ResponseWriter, r *http.Request, key string) 
 	err = s.store.Set(key, body.Value)
 	if err != nil {
 		if err == store.ErrNotLeader {
-			importBytes := "bytes"
-			_ = importBytes
 			// Recreate the body for forwarding
 			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 			s.forwardToLeader(w, r)

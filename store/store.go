@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -55,6 +56,15 @@ func (s *Store) Open() error {
 
 	s.raft = raft.New(s.raftAddr, s.peers, s.server, persister, s.applyCh)
 
+	// Replay persisted log entries to rebuild in-memory KV state.
+	// On a restart, the Raft log is restored from disk but the KV map is empty.
+	// We replay all entries to reconstruct the store's state.
+	entries := s.raft.GetCommittedLog()
+	for i, entry := range entries {
+		s.applyCommand(entry.Command, i+1)
+	}
+	log.Printf("[store] replayed %d entries from persisted log", len(entries))
+
 	if err := s.server.Start(s.raft); err != nil {
 		return fmt.Errorf("failed to start raft server: %w", err)
 	}
@@ -67,24 +77,55 @@ func (s *Store) Open() error {
 func (s *Store) applyLoop() {
 	for msg := range s.applyCh {
 		if msg.CommandValid {
-			var cmd command
-			b, ok := msg.Command.([]byte)
-			if ok {
-				if err := json.Unmarshal(b, &cmd); err == nil {
-					s.mu.Lock()
-					switch cmd.Action {
-					case actionSet:
-						s.kvStore[cmd.Key] = cmd.Value
-						log.Printf("Applied SET %s=%s (index %d)", cmd.Key, cmd.Value, msg.CommandIndex)
-					case actionDelete:
-						delete(s.kvStore, cmd.Key)
-						log.Printf("Applied DELETE %s (index %d)", cmd.Key, msg.CommandIndex)
-					}
-					s.mu.Unlock()
-				}
-			}
+			s.applyCommand(msg.Command, msg.CommandIndex)
 		}
 	}
+}
+
+// applyCommand applies a single command to the KV store.
+// The command may arrive as []byte (during normal operation) or as a string
+// (after JSON deserialization from persistence). When Go JSON-marshals a []byte,
+// it produces a base64-encoded string. On unmarshal into interface{}, this comes
+// back as a plain string containing the base64 text, which we must decode.
+func (s *Store) applyCommand(rawCmd interface{}, index int) {
+	var b []byte
+	switch v := rawCmd.(type) {
+	case []byte:
+		b = v
+	case string:
+		// JSON roundtrip: []byte -> base64 string -> interface{} gives us a base64 string.
+		decoded, err := base64Decode(v)
+		if err != nil {
+			// Not base64, try as raw JSON string
+			b = []byte(v)
+		} else {
+			b = decoded
+		}
+	default:
+		var err error
+		b, err = json.Marshal(rawCmd)
+		if err != nil {
+			log.Printf("applyCommand: unsupported command type %T at index %d", rawCmd, index)
+			return
+		}
+	}
+
+	var cmd command
+	if err := json.Unmarshal(b, &cmd); err != nil {
+		log.Printf("applyCommand: failed to unmarshal at index %d: %v", index, err)
+		return
+	}
+
+	s.mu.Lock()
+	switch cmd.Action {
+	case actionSet:
+		s.kvStore[cmd.Key] = cmd.Value
+		log.Printf("Applied SET %s=%s (index %d)", cmd.Key, cmd.Value, index)
+	case actionDelete:
+		delete(s.kvStore, cmd.Key)
+		log.Printf("Applied DELETE %s (index %d)", cmd.Key, index)
+	}
+	s.mu.Unlock()
 }
 
 // Set stores a key-value pair in the distributed store.
@@ -185,6 +226,12 @@ func (s *Store) GetAll() map[string]string {
 
 // ErrNotLeader is returned when a write operation is attempted on a non-leader node.
 var ErrNotLeader = fmt.Errorf("not the leader")
+
 func (s *Store) Stats() map[string]string {
 	return map[string]string{"type": "custom from-scratch raft"}
+}
+
+// base64Decode attempts to decode a base64-encoded string.
+func base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }

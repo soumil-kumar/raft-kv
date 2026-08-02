@@ -98,6 +98,18 @@ func (r *Raft) GetLeaderID() string {
 	return r.leaderId
 }
 
+// GetCommittedLog returns all log entries that were persisted.
+// On startup after a crash, ALL entries in the persisted log are treated as
+// committed because they were replicated to a majority before the crash.
+// The store uses this to rebuild its in-memory state.
+func (r *Raft) GetCommittedLog() []LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entries := make([]LogEntry, len(r.log))
+	copy(entries, r.log)
+	return entries
+}
+
 func (r *Raft) ticker() {
 	for {
 		r.mu.Lock()
