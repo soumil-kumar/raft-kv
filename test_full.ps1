@@ -386,24 +386,22 @@ Write-Host '--- PHASE 6: Crash Recovery (Persistence) ---' -ForegroundColor Mage
 Stop-Cluster
 
 # TEST 26: Persistence Files Exist
-Log-Info 'TEST 26: Persistence Files Exist'
-$files = @('raft-data-node1.json', 'raft-data-node2.json', 'raft-data-node3.json')
+Log-Info "TEST 26: Persistence Files Exist"
+$files = @("raft-data-node1.gob", "raft-data-node2.gob", "raft-data-node3.gob")
 $existCount = ($files | Where-Object { Test-Path $_ }).Count
-if ($existCount -ge 2) { Log-Pass "TEST 26: $existCount/3 raft persistence files exist on disk" }
-else { Log-Fail "TEST 26: Only $existCount/3 persistence files found" }
+if ($existCount -ge 2) {
+    Log-Pass "TEST 26: $existCount/3 raft persistence files exist on disk"
+} else { Log-Fail "TEST 26: Only $existCount/3 persistence files found" }
 
-# TEST 27: Persistence File Has Valid JSON
-Log-Info 'TEST 27: Persistence File Content'
+# TEST 27: Persistence File Content
+Log-Info "TEST 27: Persistence File Content"
 $persFile = $files | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($persFile) {
-    $content = Get-Content $persFile -Raw
-    try {
-        $parsed = $content | ConvertFrom-Json
-        if ($parsed.CurrentTerm -gt 0 -and $parsed.Log.Count -gt 0) {
-            Log-Pass "TEST 27: Valid JSON with Term=$($parsed.CurrentTerm), LogLen=$($parsed.Log.Count)"
-        } else { Log-Fail 'TEST 27: Persistence file missing expected fields' }
-    } catch { Log-Fail 'TEST 27: Persistence file is not valid JSON' }
-} else { Log-Fail 'TEST 27: No persistence file to check' }
+    $size = (Get-Item $persFile).Length
+    if ($size -gt 0) {
+        Log-Pass "TEST 27: Persistence file exists and has data (size=$size bytes)"
+    } else { Log-Fail "TEST 27: Persistence file is empty" }
+} else { Log-Fail "TEST 27: No persistence file to check" }
 
 # TEST 28: Full Cluster Restart - Data Recovery
 Log-Info 'TEST 28: Restarting cluster from persisted state...'

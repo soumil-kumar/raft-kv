@@ -1,13 +1,13 @@
 Remove-Item raft-data-*.json -ErrorAction SilentlyContinue
 
 echo "Starting Node 1..."
-Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node1", "--http-addr=:8001", "--raft-addr=:9001", "--peers=:9001,:9002,:9003" -NoNewWindow -RedirectStandardOutput "node1.log" -RedirectStandardError "node1.err.log" -PassThru -OutVariable node1
+Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node1", "--http-addr=:8001", "--raft-addr=:9001", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -NoNewWindow -RedirectStandardOutput "node1.log" -RedirectStandardError "node1.err.log" -PassThru -OutVariable node1
 
 echo "Starting Node 2..."
-Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node2", "--http-addr=:8002", "--raft-addr=:9002", "--peers=:9001,:9002,:9003" -NoNewWindow -RedirectStandardOutput "node2.log" -RedirectStandardError "node2.err.log" -PassThru -OutVariable node2
+Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node2", "--http-addr=:8002", "--raft-addr=:9002", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -NoNewWindow -RedirectStandardOutput "node2.log" -RedirectStandardError "node2.err.log" -PassThru -OutVariable node2
 
 echo "Starting Node 3..."
-Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node3", "--http-addr=:8003", "--raft-addr=:9003", "--peers=:9001,:9002,:9003" -NoNewWindow -RedirectStandardOutput "node3.log" -RedirectStandardError "node3.err.log" -PassThru -OutVariable node3
+Start-Process -FilePath ".\raft-kv.exe" -ArgumentList "--node-id=node3", "--http-addr=:8003", "--raft-addr=:9003", "--peers=:9001,:9002,:9003", "--peer-http=:8001,:8002,:8003" -NoNewWindow -RedirectStandardOutput "node3.log" -RedirectStandardError "node3.err.log" -PassThru -OutVariable node3
 
 echo "Waiting for 3 seconds for leader election..."
 Start-Sleep -Seconds 3
