@@ -83,6 +83,11 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /store", s.scan)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
+	mux.HandleFunc("GET /cluster/members", s.members)
+	mux.HandleFunc("POST /cluster/members", s.addMember)
+	mux.HandleFunc("POST /cluster/members/{id}/promote", s.promote)
+	mux.HandleFunc("DELETE /cluster/members/{id}", s.removeMember)
+	mux.HandleFunc("POST /cluster/transfer", s.transfer)
 	return mux
 }
 
@@ -308,6 +313,59 @@ func (s *Service) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// --- cluster ---
+
+func (s *Service) members(w http.ResponseWriter, _ *http.Request) {
+	st := s.store.Raft().Status()
+	reply(w, http.StatusOK, map[string]any{"leader": st.LeaderID, "members": st.Members})
+}
+
+func (s *Service) admin(w http.ResponseWriter, r *http.Request, body []byte, do func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.opt.Timeout)
+	defer cancel()
+	err := do(ctx)
+	switch {
+	case err == nil:
+		reply(w, http.StatusOK, map[string]string{"status": "ok"})
+	case errors.Is(err, raft.ErrNotLeader):
+		s.forward(ctx, w, r, body)
+	case errors.Is(err, raft.ErrConfigPending):
+		unavailable(w, "config_pending", err.Error())
+	case errors.Is(err, raft.ErrLeadershipLost), errors.Is(err, raft.ErrOverloaded), errors.Is(err, raft.ErrTransferring),
+		errors.Is(err, raft.ErrStopped), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		writeError(w, err)
+	default:
+		fail(w, http.StatusConflict, "rejected", err.Error())
+	}
+}
+
+func (s *Service) addMember(w http.ResponseWriter, r *http.Request) {
+	raw, ok := s.body(w, r)
+	if !ok {
+		return
+	}
+	var m raft.Member
+	if err := strictJSON(raw, &m); err != nil || m.ID == "" || m.RaftAddr == "" || m.HTTPAddr == "" {
+		fail(w, http.StatusBadRequest, "bad_request", `body must be {"id","raft_addr","http_addr"}`)
+		return
+	}
+	s.admin(w, r, raw, func(ctx context.Context) error { return s.store.Raft().AddLearner(ctx, m) })
+}
+
+func (s *Service) promote(w http.ResponseWriter, r *http.Request) {
+	s.admin(w, r, nil, func(ctx context.Context) error { return s.store.Raft().Promote(ctx, r.PathValue("id")) })
+}
+
+func (s *Service) removeMember(w http.ResponseWriter, r *http.Request) {
+	s.admin(w, r, nil, func(ctx context.Context) error { return s.store.Raft().RemoveMember(ctx, r.PathValue("id")) })
+}
+
+func (s *Service) transfer(w http.ResponseWriter, r *http.Request) {
+	s.admin(w, r, nil, func(ctx context.Context) error {
+		return s.store.Raft().TransferLeadership(ctx, r.URL.Query().Get("target"))
+	})
 }
 
 // --- observability ---

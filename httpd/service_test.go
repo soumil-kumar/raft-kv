@@ -179,6 +179,8 @@ func TestRequestValidation(t *testing.T) {
 		{"zero seq", "PUT", "/store/k", `{"value":"x"}`, map[string]string{"X-Client-Id": "c", "X-Sequence-Num": "0"}, 400},
 		{"bad if_version", "PUT", "/store/k?if_version=x", `{"value":"x"}`, nil, 400},
 		{"bad limit", "GET", "/store?limit=0", "", nil, 400},
+		{"bad member", "POST", "/cluster/members", `{"id":"x"}`, nil, 400},
+		{"duplicate member", "POST", "/cluster/members", `{"id":"n1","raft_addr":"a:1","http_addr":"a:2"}`, nil, 409},
 		{"unknown path", "GET", "/nope", "", nil, 404},
 	}
 	for _, tc := range cases {
@@ -268,6 +270,34 @@ func TestNoQuorumGetsAProperError(t *testing.T) {
 	}
 	if code, _ := call(t, "GET", l.base+"/healthz", "", nil); code != 200 {
 		t.Fatalf("healthz: %d", code)
+	}
+}
+
+func TestTransferAndMembershipOverHTTP(t *testing.T) {
+	nodes := startCluster(t, 3, 0)
+	_, f := leaderAndFollower(t, nodes)
+	if code, out := call(t, "POST", f.base+"/cluster/transfer?target="+f.id, "", nil); code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !f.store.Raft().IsLeader() {
+		if time.Now().After(deadline) {
+			t.Fatal("target never took over")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitReady(t, f)
+	if code, out := call(t, "POST", f.base+"/cluster/members", `{"id":"n4","raft_addr":"127.0.0.1:1","http_addr":"127.0.0.1:2"}`, nil); code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	if _, out := call(t, "GET", nodes[0].base+"/cluster/members", "", nil); len(out["members"].([]any)) < 3 {
+		t.Fatalf("%v", out)
+	}
+	if code, out := call(t, "DELETE", f.base+"/cluster/members/n4", "", nil); code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	if code, _ := call(t, "DELETE", f.base+"/cluster/members/n4", "", nil); code != 409 {
+		t.Fatalf("removing a missing member: %d", code)
 	}
 }
 
