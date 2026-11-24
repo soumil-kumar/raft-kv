@@ -86,6 +86,31 @@ func TestStaleNodeCannotEraseCommittedWrite(t *testing.T) {
 	}
 }
 
+// Regression: an overwritten, never-committed entry came back after a restart
+// and shifted every later entry by one.
+func TestOverwrittenEntryStaysGoneAfterRestart(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("k0")
+	a := c.leader().id
+	c.net.partition([]string{a}, c.others(a))
+	go propose(c.nodes[a], "never-committed", time.Second)
+	go propose(c.nodes[a], "never-committed-2", time.Second)
+	c.leader(c.others(a)...)
+	time.Sleep(50 * time.Millisecond)
+	c.net.heal()
+	c.write("k1")
+	c.write("k2")
+	c.converge()
+	c.crash(a)
+	c.start(a)
+	c.write("k3")
+	c.write("k4")
+	got := c.converge()
+	if fmt.Sprint(got) != "[k0 k1 k2 k3 k4]" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestPreVotePreventsTermInflation(t *testing.T) {
 	c := newCluster(t, 3, nil)
 	l := c.leader()
