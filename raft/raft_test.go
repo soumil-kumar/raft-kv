@@ -59,6 +59,33 @@ func TestFullClusterRestart(t *testing.T) {
 	}
 }
 
+// Regression: LastLogIndex was overstated by one, letting a node that missed a
+// committed entry win the election and erase it.
+func TestStaleNodeCannotEraseCommittedWrite(t *testing.T) {
+	for trial := range 5 {
+		t.Run(fmt.Sprint(trial), func(t *testing.T) {
+			c := newCluster(t, 3, nil)
+			a := c.leader().id
+			rest := c.others(a)
+			b, stale := rest[0], rest[1]
+			c.crash(stale)
+			c.write("committed")
+			c.crash(a)
+			c.crash(b)
+			c.start(stale) // the stale node gets a head start on its timer
+			time.Sleep(140 * time.Millisecond)
+			c.start(b)
+			if l := c.leader(); l.id != b {
+				t.Fatalf("%s won without the committed entry", l.id)
+			}
+			c.start(a)
+			if got := c.converge(); len(got) != 1 || got[0] != "committed" {
+				t.Fatalf("committed write lost: %v", got)
+			}
+		})
+	}
+}
+
 func TestPreVotePreventsTermInflation(t *testing.T) {
 	c := newCluster(t, 3, nil)
 	l := c.leader()
