@@ -273,6 +273,33 @@ func TestNoQuorumGetsAProperError(t *testing.T) {
 	}
 }
 
+func TestScanStatusMetrics(t *testing.T) {
+	nodes := startCluster(t, 3, 0)
+	_, f := leaderAndFollower(t, nodes)
+	for _, k := range []string{"user/2", "user/1", "other"} {
+		call(t, "PUT", f.base+"/store/"+k, `{"value":"v"}`, nil)
+	}
+	_, out := call(t, "GET", f.base+"/store?prefix=user/&limit=1", "", nil)
+	items := out["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["key"] != "user/1" {
+		t.Fatalf("%v", out)
+	}
+	if _, out := call(t, "GET", f.base+"/status", "", nil); out["keys"] != 3.0 || out["is_leader"] != false || out["store"] != nil {
+		t.Fatalf("%v", out)
+	}
+	resp, err := http.Get(f.base + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{"raftkv_commit_index ", "raftkv_wal_fsyncs_total ", "# TYPE raftkv_term gauge"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+}
+
 func TestTransferAndMembershipOverHTTP(t *testing.T) {
 	nodes := startCluster(t, 3, 0)
 	_, f := leaderAndFollower(t, nodes)

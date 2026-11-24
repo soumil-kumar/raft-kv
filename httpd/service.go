@@ -81,8 +81,10 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("PUT /store/{key...}", s.put)
 	mux.HandleFunc("DELETE /store/{key...}", s.delete)
 	mux.HandleFunc("GET /store", s.scan)
+	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.ready)
+	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /cluster/members", s.members)
 	mux.HandleFunc("POST /cluster/members", s.addMember)
 	mux.HandleFunc("POST /cluster/members/{id}/promote", s.promote)
@@ -370,6 +372,15 @@ func (s *Service) transfer(w http.ResponseWriter, r *http.Request) {
 
 // --- observability ---
 
+func (s *Service) status(w http.ResponseWriter, _ *http.Request) {
+	st := s.store.Raft().Status()
+	reply(w, http.StatusOK, struct {
+		raft.Status
+		IsLeader bool `json:"is_leader"`
+		Keys     int  `json:"keys"`
+	}{st, st.Role == raft.Leader.String(), s.store.Len()})
+}
+
 // ready succeeds only if this node can serve a linearizable read right now.
 func (s *Service) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
@@ -379,6 +390,33 @@ func (s *Service) ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Service) metrics(w http.ResponseWriter, _ *http.Request) {
+	st := s.store.Raft().Status()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	metric := func(kind, name, help string, v uint64) {
+		fmt.Fprintf(w, "# HELP raftkv_%s %s\n# TYPE raftkv_%s %s\nraftkv_%s %d\n", name, help, name, kind, name, v)
+	}
+	var leader uint64
+	if st.Role == raft.Leader.String() {
+		leader = 1
+	}
+	metric("gauge", "is_leader", "1 if this node is the leader", leader)
+	metric("gauge", "term", "current Raft term", st.Term)
+	metric("gauge", "commit_index", "highest committed log index", st.CommitIndex)
+	metric("gauge", "last_applied", "highest applied log index", st.LastApplied)
+	metric("gauge", "last_index", "highest log index", st.LastIndex)
+	metric("gauge", "durable_index", "highest fsynced log index", st.DurableIndex)
+	metric("gauge", "snapshot_index", "log index covered by the snapshot", st.SnapshotIndex)
+	metric("gauge", "keys", "number of keys", uint64(s.store.Len()))
+	metric("counter", "elections_started_total", "elections started by this node", st.Elections)
+	metric("counter", "snapshots_taken_total", "snapshots taken", st.Snapshots)
+	metric("counter", "snapshots_installed_total", "snapshots received from a leader", st.Installed)
+	if fs := s.opt.Storage; fs != nil {
+		metric("counter", "wal_fsyncs_total", "WAL fsync calls", fs.SyncCount.Load())
+		metric("counter", "wal_entries_total", "log entries written to the WAL", fs.SavedEntries.Load())
+	}
 }
 
 // --- responses ---
