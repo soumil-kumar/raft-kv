@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -108,6 +109,95 @@ func TestOverwrittenEntryStaysGoneAfterRestart(t *testing.T) {
 	got := c.converge()
 	if fmt.Sprint(got) != "[k0 k1 k2 k3 k4]" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// Regression: the leader counted itself towards the commit quorum before its
+// own copy was on disk.
+func TestLeaderDoesNotCommitBeforeItsOwnFsync(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	dead := c.others(l.id)[0]
+	c.crash(dead) // leader + one follower: both must be durable
+	c.write("warm")
+	before := l.raft.Status().CommitIndex
+	l.stall.Store(true)
+	done := make(chan error, 1)
+	go func() { done <- propose(l, "x", 5*time.Second) }()
+	time.Sleep(300 * time.Millisecond)
+	if st := l.raft.Status(); st.CommitIndex != before {
+		t.Fatalf("committed %d with the leader's disk stalled", st.CommitIndex)
+	}
+	l.stall.Store(false)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommitNeedsOnlyAMajorityOfDisks(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	slow := c.nodes[c.others(l.id)[0]]
+	slow.stall.Store(true)
+	for i := range 20 {
+		if err := propose(l, fmt.Sprint(i), time.Second); err != nil {
+			t.Fatalf("write %d blocked on a slow minority: %v", i, err)
+		}
+	}
+	slow.stall.Store(false)
+	c.converge()
+}
+
+func TestDiskFailureStopsOnlyThatNode(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	l := c.leader()
+	l.crashed.Store(true) // every further write fails before fsync
+	propose(l, "doomed", 300*time.Millisecond)
+	eventually(t, 3*time.Second, "fatal callback", func() bool { return l.fatal.Load() != nil })
+	if err := propose(l, "x", 100*time.Millisecond); !errors.Is(err, ErrStopped) {
+		t.Fatalf("failed node accepted a write: %v", err)
+	}
+	c.leader(c.others(l.id)...)
+	c.write("b")
+	c.crash(l.id)
+	c.start(l.id)
+	c.converge()
+}
+
+// Regression: a candidate that met a leader of its own term forgot its vote.
+func TestVoteIsKeptWithinATerm(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	n := c.nodes[c.others(l.id)[0]]
+	c.crash(l.id)
+	c.crash(c.others(l.id)[1])
+	r := n.raft
+	r.mu.Lock()
+	r.leaderID = ""
+	r.campaign(false, false)
+	term, vote := r.term, r.votedFor
+	r.mu.Unlock()
+	if vote != n.id {
+		t.Fatalf("voted for %q", vote)
+	}
+	if _, err := r.HandleHeartbeat(&HeartbeatArgs{Term: term, LeaderID: "elsewhere"}); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	r.leaderID = "" // drop stickiness so only votedFor can refuse
+	lastIndex, lastTerm := r.log.lastIndex(), r.log.lastTerm()
+	r.mu.Unlock()
+	rep, err := r.HandleRequestVote(&RequestVoteArgs{Term: term, CandidateID: "other", LastLogIndex: lastIndex + 9, LastLogTerm: lastTerm + 9})
+	if err != nil || rep.Granted {
+		t.Fatalf("second vote in term %d: %+v %v", term, rep, err)
+	}
+	// ...and across a restart.
+	c.crash(n.id)
+	c.start(n.id)
+	rep, err = c.nodes[n.id].raft.HandleRequestVote(&RequestVoteArgs{Term: term, CandidateID: "other", LastLogIndex: lastIndex + 9, LastLogTerm: lastTerm + 9})
+	if err != nil || rep.Granted {
+		t.Fatalf("second vote after restart: %+v %v", rep, err)
 	}
 }
 
