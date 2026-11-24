@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -145,4 +146,72 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs) (*RequestVoteReply, erro
 		return nil, err
 	}
 	return reply, nil
+}
+
+// HandleTimeoutNow makes this node campaign immediately: the leader is handing
+// over and has already made sure our log is complete.
+func (r *Raft) HandleTimeoutNow(args *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return nil, ErrStopped
+	}
+	if args.Term == r.term && r.role == Follower && r.conf().isVoter(r.id) {
+		r.campaign(false, true)
+	}
+	return &TimeoutNowReply{Term: r.term}, nil
+}
+
+// TransferLeadership hands leadership to the most up-to-date voter, or to
+// target if it is not empty, and waits until this node is no longer leader.
+func (r *Raft) TransferLeadership(ctx context.Context, target string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.role != Leader {
+		return ErrNotLeader
+	}
+	if r.transferring {
+		return ErrTransferring
+	}
+	var best *peer
+	for id, p := range r.peers {
+		if !r.conf().isVoter(id) || (target != "" && id != target) {
+			continue
+		}
+		if best == nil || p.match > best.match {
+			best = p
+		}
+	}
+	if best == nil {
+		return errors.New("raft: no suitable transfer target")
+	}
+	term := r.term
+	r.transferring = true // no new proposals, so the target can catch up
+	defer func() {
+		if r.term == term {
+			r.transferring = false
+		}
+	}()
+	stop := r.wakeOnDone(ctx)
+	defer stop()
+
+	sent := false
+	for r.role == Leader && r.term == term {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !sent && best.match == r.log.lastIndex() && r.commitIndex >= r.termStart {
+			sent = true
+			m, args := best.member, &TimeoutNowArgs{Term: term, LeaderID: r.id}
+			r.wg.Add(1)
+			go func() {
+				defer r.wg.Done()
+				c, cancel := context.WithTimeout(r.stopCtx, r.cfg.RPCTimeout)
+				defer cancel()
+				r.transport.TimeoutNow(c, m, args)
+			}()
+		}
+		r.readCond.Wait()
+	}
+	return nil
 }

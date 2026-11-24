@@ -494,6 +494,40 @@ func TestNewLeaderReadsWaitForItsFirstCommit(t *testing.T) {
 	r.mu.Unlock()
 }
 
+func TestLeadershipTransfer(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	l := c.leader()
+	target := c.others(l.id)[0]
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := l.raft.TransferLeadership(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.leader().id; got != target {
+		t.Fatalf("leader is %s, want %s", got, target)
+	}
+	if d := time.Since(start); d > 140*time.Millisecond {
+		t.Logf("transfer took %v (an election timeout is 150ms)", d)
+	}
+	c.write("b")
+	c.converge()
+}
+
+func TestTransferToDeadNodeTimesOutAndRecovers(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	dead := c.others(l.id)[0]
+	c.crash(dead)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := l.raft.TransferLeadership(ctx, dead); err == nil {
+		t.Fatal("transfer to a dead node succeeded")
+	}
+	c.write("still works")
+}
+
 func TestBackpressure(t *testing.T) {
 	c := newCluster(t, 3, func(cfg *Config) {
 		cfg.MaxUncommittedBytes = 1000

@@ -15,6 +15,7 @@ type Transport interface {
 	Heartbeat(ctx context.Context, to Member, args *HeartbeatArgs) (*HeartbeatReply, error)
 	AppendEntries(ctx context.Context, to Member, args *AppendEntriesArgs) (*AppendEntriesReply, error)
 	InstallSnapshot(ctx context.Context, to Member, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
+	TimeoutNow(ctx context.Context, to Member, args *TimeoutNowArgs) (*TimeoutNowReply, error)
 	ReadIndex(ctx context.Context, to Member, args *ReadIndexArgs) (*ReadIndexReply, error)
 }
 
@@ -128,6 +129,14 @@ func (t *TCPTransport) AppendEntries(ctx context.Context, to Member, a *AppendEn
 func (t *TCPTransport) InstallSnapshot(ctx context.Context, to Member, a *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 	var r InstallSnapshotReply
 	if err := t.call(ctx, to, true, "InstallSnapshot", a, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (t *TCPTransport) TimeoutNow(ctx context.Context, to Member, a *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	var r TimeoutNowReply
+	if err := t.call(ctx, to, false, "TimeoutNow", a, &r); err != nil {
 		return nil, err
 	}
 	return &r, nil
