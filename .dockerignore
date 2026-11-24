@@ -1,0 +1,7 @@
+.git
+.agents
+data
+*.exe
+*.log
+*.err
+raft-data-*
