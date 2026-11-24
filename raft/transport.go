@@ -160,3 +160,85 @@ func (t *TCPTransport) Close() {
 		delete(t.conns, k)
 	}
 }
+
+// Server exposes a node's RPC handlers on a listener.
+type Server struct {
+	ln net.Listener
+
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+}
+
+type rpcService struct{ r *Raft }
+
+func (s *rpcService) RequestVote(a *RequestVoteArgs, out *RequestVoteReply) error {
+	return put(out)(s.r.HandleRequestVote(a))
+}
+func (s *rpcService) Heartbeat(a *HeartbeatArgs, out *HeartbeatReply) error {
+	return put(out)(s.r.HandleHeartbeat(a))
+}
+func (s *rpcService) AppendEntries(a *AppendEntriesArgs, out *AppendEntriesReply) error {
+	return put(out)(s.r.HandleAppendEntries(a))
+}
+func (s *rpcService) InstallSnapshot(a *InstallSnapshotArgs, out *InstallSnapshotReply) error {
+	return put(out)(s.r.HandleInstallSnapshot(a))
+}
+func (s *rpcService) TimeoutNow(a *TimeoutNowArgs, out *TimeoutNowReply) error {
+	return put(out)(s.r.HandleTimeoutNow(a))
+}
+func (s *rpcService) ReadIndex(a *ReadIndexArgs, out *ReadIndexReply) error {
+	return put(out)(s.r.HandleReadIndex(a))
+}
+
+func put[T any](out *T) func(*T, error) error {
+	return func(reply *T, err error) error {
+		if err == nil {
+			*out = *reply
+		}
+		return err
+	}
+}
+
+// Serve starts answering RPCs for r on ln.
+func Serve(ln net.Listener, r *Raft) (*Server, error) {
+	rs := rpc.NewServer()
+	if err := rs.RegisterName("Raft", &rpcService{r}); err != nil {
+		return nil, err
+	}
+	s := &Server{ln: ln, conns: map[net.Conn]struct{}{}}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				conn.Close()
+				return
+			}
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
+			go func() {
+				rs.ServeConn(conn)
+				s.mu.Lock()
+				delete(s.conns, conn)
+				s.mu.Unlock()
+			}()
+		}
+	}()
+	return s, nil
+}
+
+// Close stops the listener and every open connection.
+func (s *Server) Close() {
+	s.ln.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	for c := range s.conns {
+		c.Close()
+	}
+}
