@@ -640,6 +640,9 @@ func (r *Raft) propose(ctx context.Context, t EntryType, build func() ([]byte, e
 	case r.transferring:
 		r.mu.Unlock()
 		return nil, ErrTransferring
+	case r.uncommitted > r.cfg.MaxUncommittedBytes:
+		r.mu.Unlock()
+		return nil, ErrOverloaded
 	}
 	data, err := build()
 	if err != nil {

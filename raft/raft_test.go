@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -261,6 +262,24 @@ func TestMinorityCannotCommit(t *testing.T) {
 	c.net.heal()
 	if got := c.converge(); fmt.Sprint(got) != "[kept]" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestBackpressure(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) {
+		cfg.MaxUncommittedBytes = 1000
+		cfg.ElectionTimeout = 2 * time.Second // stay leader while cut off
+	})
+	l := c.leader()
+	c.net.partition([]string{l.id}, c.others(l.id))
+	var refused atomic.Int32
+	for range 50 {
+		if err := propose(l, string(make([]byte, 100)), 5*time.Millisecond); errors.Is(err, ErrOverloaded) {
+			refused.Add(1)
+		}
+	}
+	if refused.Load() == 0 {
+		t.Fatal("leader queued unbounded uncommitted data")
 	}
 }
 
