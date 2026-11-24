@@ -528,6 +528,104 @@ func TestTransferToDeadNodeTimesOutAndRecovers(t *testing.T) {
 	c.write("still works")
 }
 
+func TestMembershipGrowAndShrink(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) { cfg.SnapshotThreshold, cfg.TrailingLogs = 50, 5 })
+	for i := range 200 {
+		c.write(fmt.Sprint(i))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for _, id := range []string{"n4", "n5"} {
+		c.nodes[id] = &node{id: id, dir: t.TempDir()}
+		c.startWith(id, Configuration{}) // joins empty
+		if err := c.leader().raft.AddLearner(ctx, Member{ID: id, RaftAddr: id}); err != nil {
+			t.Fatal(err)
+		}
+		if st := c.leader().raft.Status(); len(st.Members) < 4 {
+			t.Fatalf("members %v", st.Members)
+		}
+		eventually(t, 10*time.Second, "promotion of "+id, func() bool {
+			return c.leader().raft.Promote(ctx, id) == nil
+		})
+	}
+	c.converge()
+
+	// Five voters tolerate two failures.
+	l := c.leader().id
+	down := c.others(l)[:2]
+	c.crash(down[0])
+	c.crash(down[1])
+	c.write("two down")
+	c.start(down[0])
+	c.start(down[1])
+
+	// Remove the leader itself, then one more.
+	old := c.leader()
+	if err := old.raft.RemoveMember(ctx, old.id); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "removed leader to step down", func() bool { return !old.raft.IsLeader() })
+	nl := c.leader(c.others(old.id)...)
+	if _, ok := (Configuration{Members: nl.raft.Status().Members}).Find(old.id); ok {
+		t.Fatal("removed member still listed")
+	}
+	c.write("after removal")
+	term := nl.raft.Status().Term
+	time.Sleep(600 * time.Millisecond)
+	if got := c.leader(c.others(old.id)...).raft.Status().Term; got != term {
+		t.Fatalf("removed node disrupted the cluster: term %d -> %d", term, got)
+	}
+	c.crash(old.id)
+	delete(c.nodes, old.id)
+
+	// Membership must survive a full restart, including through snapshots.
+	for i := range 100 {
+		c.write(fmt.Sprint("more-", i))
+	}
+	for _, n := range c.live() {
+		c.crash(n.id)
+	}
+	for id := range c.nodes {
+		c.startWith(id, Configuration{})
+	}
+	c.write("restarted")
+	if got := len(c.leader().raft.Status().Members); got != 4 {
+		t.Fatalf("%d members after restart, want 4", got)
+	}
+	c.converge()
+}
+
+func TestMembershipGuards(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := l.raft.AddLearner(ctx, Member{ID: "n1", RaftAddr: "dup"}); err == nil {
+		t.Fatal("duplicate id accepted")
+	}
+	if err := l.raft.Promote(ctx, "ghost"); err == nil {
+		t.Fatal("promoted a non-member")
+	}
+	if err := l.raft.AddLearner(ctx, Member{ID: "n9", RaftAddr: "nowhere"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range promoteLag + 10 {
+		c.write(fmt.Sprint(i))
+	}
+	if err := l.raft.Promote(ctx, "n9"); err == nil {
+		t.Fatal("promoted a learner that has nothing")
+	}
+	// While one change is uncommitted, a second must be refused.
+	c.net.partition([]string{l.id}, c.others(l.id))
+	go l.raft.RemoveMember(ctx, "n9")
+	time.Sleep(30 * time.Millisecond)
+	if err := l.raft.AddLearner(ctx, Member{ID: "n8", RaftAddr: "n8"}); !errors.Is(err, ErrConfigPending) {
+		t.Fatalf("got %v", err)
+	}
+	c.net.heal()
+}
+
 func TestBackpressure(t *testing.T) {
 	c := newCluster(t, 3, func(cfg *Config) {
 		cfg.MaxUncommittedBytes = 1000
