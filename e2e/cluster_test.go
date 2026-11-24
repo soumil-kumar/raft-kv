@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -156,13 +157,22 @@ type cluster struct {
 	mu    sync.Mutex
 }
 
+var nextPort = 20000 + rand.IntN(5000)
+
+// freeAddr picks a port below every OS's ephemeral range. A port from ":0" can
+// be handed to some outgoing connection between this check and the bind.
 func freeAddr(t *testing.T) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for ; nextPort < 32000; nextPort++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", nextPort))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		nextPort++
+		return ln.Addr().String()
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	t.Fatal("no free port")
+	return ""
 }
 
 func (c *cluster) newProc(id string) *proc {
