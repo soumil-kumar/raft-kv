@@ -1,21 +1,13 @@
-# Build stage
 FROM golang:1.24-alpine AS builder
-
 WORKDIR /app
-
-# Copy dependency files first for better Docker caching
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy source code and build
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /raft-kv .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ . ./cmd/raft-bench
 
-# Runtime stage — minimal image
-FROM alpine:3.19
-
-RUN apk add --no-cache ca-certificates curl
-
-COPY --from=builder /raft-kv /usr/local/bin/raft-kv
-
+FROM alpine:3.20
+RUN adduser -D -u 10001 raft && mkdir /data && chown raft /data
+COPY --from=builder /out/ /usr/local/bin/
+USER raft
+VOLUME /data
 ENTRYPOINT ["raft-kv"]
