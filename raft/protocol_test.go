@@ -255,6 +255,11 @@ func TestLearnersDoNotCount(t *testing.T) {
 	if r.commitIndex != 0 {
 		t.Fatalf("learners formed a commit quorum: %d", r.commitIndex)
 	}
+	r.readSeq = 7
+	r.peers["l1"].ackedSeq, r.peers["l2"].ackedSeq = 7, 7
+	if r.quorumAcked(7) {
+		t.Fatal("learners formed a read quorum")
+	}
 	r.campaignToken++
 	r.role = Candidate
 	r.votes = map[string]bool{"n1": true, "l1": true, "l2": true}

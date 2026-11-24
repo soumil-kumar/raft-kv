@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -353,7 +354,7 @@ func TestLostLeadershipReportsUnknownOutcome(t *testing.T) {
 	}
 }
 
-func TestMinorityCannotCommit(t *testing.T) {
+func TestMinorityCannotCommitOrRead(t *testing.T) {
 	c := newCluster(t, 5, nil)
 	l := c.leader()
 	rest := c.others(l.id)
@@ -364,6 +365,13 @@ func TestMinorityCannotCommit(t *testing.T) {
 	if got := l.raft.Status().CommitIndex; got != before {
 		t.Fatalf("minority committed %d", got)
 	}
+	for _, id := range minority {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		if err := c.nodes[id].raft.LinearizableRead(ctx); err == nil {
+			t.Fatalf("%s served a linearizable read from the minority", id)
+		}
+		cancel()
+	}
 	nl := c.leader(rest[1:]...)
 	if err := propose(nl, "kept", 2*time.Second); err != nil {
 		t.Fatal(err)
@@ -372,6 +380,118 @@ func TestMinorityCannotCommit(t *testing.T) {
 	if got := c.converge(); fmt.Sprint(got) != "[kept]" {
 		t.Fatalf("got %v", got)
 	}
+}
+
+// Regression: reads failed with "lost quorum" whenever followers trailed the
+// leader's newest entry, which is always true under write load.
+func TestReadsSucceedUnderWriteLoad(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.leader()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					c.write(fmt.Sprint(i))
+				}
+			}
+		}()
+	}
+	for i := range 300 {
+		n := c.nodes[ids(3)[i%3]] // leader and followers alike
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := n.raft.LinearizableRead(ctx); err != nil {
+			t.Errorf("read %d on %s: %v", i, n.id, err)
+		}
+		cancel()
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// Regression: ReadIndex waited for every peer, so one hung follower cost a full
+// RPC timeout per read.
+func TestFrozenFollowerDoesNotSlowReads(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	l := c.leader()
+	c.net.freeze(c.others(l.id)[0], true)
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	for range 50 {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := l.raft.LinearizableRead(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	}
+	if d := time.Since(start) / 50; d > 30*time.Millisecond {
+		t.Fatalf("reads took %v each", d)
+	}
+}
+
+func TestReadsDoNotWaitForFollowerDisks(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	l := c.leader()
+	for _, id := range c.others(l.id) {
+		c.nodes[id].stall.Store(true)
+	}
+	go propose(l, "stuck", time.Second) // leaves followers busy in fsync
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := l.raft.LinearizableRead(ctx); err != nil {
+		t.Fatalf("read blocked behind a follower fsync: %v", err)
+	}
+	for _, id := range c.others(l.id) {
+		c.nodes[id].stall.Store(false)
+	}
+}
+
+// Every read must see every write acknowledged before it started, on any node.
+func TestFollowerReadsSeeAcknowledgedWrites(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	for i := range 60 {
+		c.write(fmt.Sprint(i))
+		for _, n := range c.live() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := n.raft.LinearizableRead(ctx)
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(n.sm.commands()); got < i+1 {
+				t.Fatalf("%s saw %d of %d acknowledged writes", n.id, got, i+1)
+			}
+		}
+	}
+}
+
+// A fresh leader must not serve reads until it has committed in its own term.
+func TestNewLeaderReadsWaitForItsFirstCommit(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	r := c.leader().raft
+	r.mu.Lock()
+	save := r.termStart
+	r.termStart = r.log.lastIndex() + 1 // as if the no-op had not committed yet
+	r.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	err := r.LinearizableRead(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
+	}
+	r.mu.Lock()
+	r.termStart = save
+	r.mu.Unlock()
 }
 
 func TestBackpressure(t *testing.T) {
@@ -502,4 +622,21 @@ func chaos(t *testing.T, size int, d time.Duration) {
 		}
 	}
 	t.Logf("%d acknowledged, %d applied, %d terms had leaders", len(acked), len(final), len(c.leaders))
+}
+
+// A leader that was cut off still believes it leads until check-quorum fires.
+// In that window only the ReadIndex heartbeat round prevents a stale read.
+func TestPartitionedLeaderCannotServeReads(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	c.write("a")
+	l := c.leader()
+	c.net.partition([]string{l.id}, c.others(l.id))
+	if !l.raft.IsLeader() {
+		t.Skip("stepped down before the read")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := l.raft.LinearizableRead(ctx); err == nil {
+		t.Fatal("cut-off leader served a linearizable read")
+	}
 }

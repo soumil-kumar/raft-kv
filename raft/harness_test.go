@@ -129,6 +129,9 @@ func (e endpoint) AppendEntries(ctx context.Context, to Member, a *AppendEntries
 func (e endpoint) InstallSnapshot(ctx context.Context, to Member, a *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 	return send(ctx, e.net, e.from, to.ID, a, (*Raft).HandleInstallSnapshot)
 }
+func (e endpoint) ReadIndex(ctx context.Context, to Member, a *ReadIndexArgs) (*ReadIndexReply, error) {
+	return send(ctx, e.net, e.from, to.ID, a, (*Raft).HandleReadIndex)
+}
 
 // --- state machine ---
 
