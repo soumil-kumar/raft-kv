@@ -184,8 +184,9 @@ func (r *Raft) replicateOnce(ctx context.Context, p *peer, term uint64) (more bo
 	prev := p.next - 1
 	prevTerm, ok := r.log.term(prev)
 	if !ok {
+		meta := r.snap
 		r.mu.Unlock()
-		return false, fmt.Errorf("raft: entry %d is compacted", prev)
+		return true, r.sendSnapshot(ctx, p, term, meta)
 	}
 	seq := r.readSeq
 	args := &AppendEntriesArgs{

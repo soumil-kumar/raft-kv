@@ -165,6 +165,7 @@ type Raft struct {
 	snapshotting   bool
 	bytesSinceSnap uint64
 	lastSnapSize   uint64
+	incoming       *incomingSnapshot
 
 	// Leader state.
 	leaderCtx     context.Context
@@ -617,6 +618,9 @@ func (r *Raft) applyLoop() {
 			r.becomeFollower(r.term, "")
 		}
 		r.readCond.Broadcast()
+		if !r.stopped && !r.restorePending {
+			r.maybeSnapshot(last)
+		}
 		r.mu.Unlock()
 	}
 }

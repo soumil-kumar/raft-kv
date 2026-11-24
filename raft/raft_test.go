@@ -63,6 +63,35 @@ func TestFullClusterRestart(t *testing.T) {
 	}
 }
 
+// Regression: after a snapshot, candidates advertised the length of their
+// in-memory log rather than its absolute last index, so nobody could ever win
+// an election again.
+func TestFailoverAfterSnapshot(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) { cfg.SnapshotThreshold, cfg.TrailingLogs = 50, 5 })
+	for i := range 300 {
+		c.write(fmt.Sprint(i))
+	}
+	for _, n := range c.live() {
+		eventually(t, 5*time.Second, n.id+" snapshot", func() bool { return n.raft.Status().SnapshotIndex > 0 })
+	}
+	for i := range 3 {
+		old := c.leader().id
+		c.crash(old)
+		c.write(fmt.Sprint("failover-", i))
+		c.start(old)
+	}
+	for _, id := range ids(3) {
+		c.crash(id)
+	}
+	for _, id := range ids(3) {
+		c.start(id)
+	}
+	c.write("end")
+	if got := c.converge(); len(got) != 304 {
+		t.Fatalf("applied %d commands, want 304", len(got))
+	}
+}
+
 // Regression: LastLogIndex was overstated by one, letting a node that missed a
 // committed entry win the election and erase it.
 func TestStaleNodeCannotEraseCommittedWrite(t *testing.T) {
@@ -90,6 +119,53 @@ func TestStaleNodeCannotEraseCommittedWrite(t *testing.T) {
 	}
 }
 
+// Regression: only the first chunk of a snapshot larger than the chunk size was
+// installed, yet the follower was considered caught up.
+func TestInstallMultiChunkSnapshot(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) {
+		cfg.SnapshotThreshold, cfg.TrailingLogs, cfg.SnapshotChunk = 100, 5, 512
+	})
+	lag := c.others(c.leader().id)[0]
+	c.write("first")
+	c.crash(lag)
+	for i := range 400 {
+		c.write(fmt.Sprintf("value-%04d-xxxxxxxxxxxxxxxxxxxxxxxx", i))
+	}
+	c.start(lag)
+	if got := c.converge(); len(got) != 401 {
+		t.Fatalf("got %d commands", len(got))
+	}
+	if n := c.nodes[lag].raft.Status().Installed; n == 0 {
+		t.Fatal("test did not exercise InstallSnapshot")
+	}
+	// The installed state must itself survive a restart and later appends.
+	c.crash(lag)
+	c.write("x")
+	c.start(lag)
+	c.write("y")
+	if got := c.converge(); len(got) != 403 {
+		t.Fatalf("after restart got %d commands", len(got))
+	}
+}
+
+func TestInstallSnapshotOverLossyNetwork(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) {
+		cfg.SnapshotThreshold, cfg.TrailingLogs, cfg.SnapshotChunk = 50, 5, 1024
+	})
+	lag := c.others(c.leader().id)[0]
+	c.crash(lag)
+	for i := range 300 {
+		c.write(fmt.Sprintf("value-%04d", i))
+	}
+	c.net.mu.Lock()
+	c.net.dropProb, c.net.maxDelay = 0.15, 5*time.Millisecond
+	c.net.mu.Unlock()
+	c.start(lag)
+	if got := c.converge(); len(got) < 300 {
+		t.Fatalf("got %d commands", len(got))
+	}
+}
+
 // Regression: an overwritten, never-committed entry came back after a restart
 // and shifted every later entry by one.
 func TestOverwrittenEntryStaysGoneAfterRestart(t *testing.T) {
@@ -112,6 +188,39 @@ func TestOverwrittenEntryStaysGoneAfterRestart(t *testing.T) {
 	got := c.converge()
 	if fmt.Sprint(got) != "[k0 k1 k2 k3 k4]" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// Regression: entries queued for disk while a snapshot was taken were written
+// twice, so a restarted leader had a shifted log.
+func TestSnapshotUnderLoadThenRestart(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) { cfg.SnapshotThreshold, cfg.TrailingLogs = 40, 10 })
+	c.leader()
+	var wg sync.WaitGroup
+	for w := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 40 {
+				c.write(fmt.Sprintf("%d-%d", w, i))
+			}
+		}()
+	}
+	wg.Wait()
+	c.converge()
+	for _, id := range ids(3) {
+		last := c.nodes[id].raft.Status().LastIndex
+		eventually(t, 5*time.Second, "durable log", func() bool { return c.nodes[id].raft.Status().DurableIndex == last })
+		c.crash(id)
+		c.start(id)
+		// Compare before anything new is replicated: entry indices must line up.
+		if got := c.nodes[id].raft.Status().LastIndex; got < last {
+			t.Fatalf("%s lost entries across restart: %d < %d", id, got, last)
+		}
+	}
+	c.write("end")
+	if got := c.converge(); len(got) != 801 {
+		t.Fatalf("got %d commands", len(got))
 	}
 }
 

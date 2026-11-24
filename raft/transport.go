@@ -14,6 +14,7 @@ type Transport interface {
 	RequestVote(ctx context.Context, to Member, args *RequestVoteArgs) (*RequestVoteReply, error)
 	Heartbeat(ctx context.Context, to Member, args *HeartbeatArgs) (*HeartbeatReply, error)
 	AppendEntries(ctx context.Context, to Member, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	InstallSnapshot(ctx context.Context, to Member, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
 
 // TCPTransport implements Transport over net/rpc. Each peer gets two
@@ -118,6 +119,14 @@ func (t *TCPTransport) Heartbeat(ctx context.Context, to Member, a *HeartbeatArg
 func (t *TCPTransport) AppendEntries(ctx context.Context, to Member, a *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	var r AppendEntriesReply
 	if err := t.call(ctx, to, true, "AppendEntries", a, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (t *TCPTransport) InstallSnapshot(ctx context.Context, to Member, a *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	var r InstallSnapshotReply
+	if err := t.call(ctx, to, true, "InstallSnapshot", a, &r); err != nil {
 		return nil, err
 	}
 	return &r, nil

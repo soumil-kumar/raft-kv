@@ -126,6 +126,9 @@ func (e endpoint) Heartbeat(ctx context.Context, to Member, a *HeartbeatArgs) (*
 func (e endpoint) AppendEntries(ctx context.Context, to Member, a *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	return send(ctx, e.net, e.from, to.ID, a, (*Raft).HandleAppendEntries)
 }
+func (e endpoint) InstallSnapshot(ctx context.Context, to Member, a *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	return send(ctx, e.net, e.from, to.ID, a, (*Raft).HandleInstallSnapshot)
+}
 
 // --- state machine ---
 

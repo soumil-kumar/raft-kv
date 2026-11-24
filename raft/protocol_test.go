@@ -295,3 +295,36 @@ func TestHeartbeatCommitIsBoundedByTheLog(t *testing.T) {
 		t.Fatalf("commit %d", got)
 	}
 }
+
+func TestSnapshotChunksOutOfOrder(t *testing.T) {
+	_, n := solo(t)
+	r := n.raft
+	data := []byte(`{"last":5,"cmds":["a","b"]}`)
+	meta := SnapshotMeta{Index: 5, Term: 1, Config: r.conf()}
+	chunk := func(off, end int, done bool) *InstallSnapshotReply {
+		rep, err := r.HandleInstallSnapshot(&InstallSnapshotArgs{Term: 1, LeaderID: "n2", Meta: meta,
+			Offset: uint64(off), Data: data[off:end], Done: done})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	if rep := chunk(10, len(data), true); rep.Offset != 0 || rep.Installed {
+		t.Fatalf("accepted a tail with no head: %+v", rep)
+	}
+	chunk(0, 10, false)
+	chunk(10, 20, false)
+	if rep := chunk(10, 20, false); rep.Offset != 20 {
+		t.Fatalf("duplicate chunk: %+v", rep)
+	}
+	if st := r.Status(); st.CommitIndex != 0 || st.SnapshotIndex != 0 {
+		t.Fatalf("partial snapshot changed state: %+v", st)
+	}
+	if rep := chunk(20, len(data), true); !rep.Installed {
+		t.Fatalf("got %+v", rep)
+	}
+	eventually(t, time.Second, "restore", func() bool { return r.Status().LastApplied == 5 })
+	if got := n.sm.commands(); len(got) != 2 {
+		t.Fatalf("restored %v", got)
+	}
+}
