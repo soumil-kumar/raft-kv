@@ -1,112 +1,126 @@
-# Raft Key-Value Store
+# raft-kv
 
-> **Performance**: 1006 requests/sec, 94.3ms avg latency (10,000 requests, 100 concurrency, 3-node cluster, strictly consistent fsync per append)
-> *Note on Throughput*: The current architecture strictly calls `fsync()` on every single log append on followers to guarantee Raft safety rules. This disk I/O bottleneck caps throughput. A production system would implement **Group Commit / Batching** on followers to alleviate this and achieve 10,000+ RPS.
+A replicated, linearizable key-value store in Go, built on a Raft implementation
+written from scratch. The server uses only the standard library; the one
+dependency, [Porcupine](https://github.com/anishathalye/porcupine), is used by
+tests to check linearizability.
 
-A fault-tolerant, distributed key-value store built in Go, featuring an implementation of the Raft consensus protocol **inspired by the architecture of MIT's 6.824 Distributed Systems course**. Data is replicated across a cluster of nodes and survives node failures with zero data loss.
+## What it does
 
-This project was built to deeply understand distributed systems, consensus algorithms, and the challenges of implementing the Raft paper (Diego Ongaro and John Ousterhout) without relying on external libraries like `hashicorp/raft`. The testing harness and core architectural patterns draw heavily from the MIT 6.824 lab structures.
+- **Raft**: pre-vote, leader election, log replication with fast conflict
+  backtracking, check-quorum, leadership transfer, chunked snapshot transfer,
+  and single-server membership changes with non-voting learners.
+- **Durability**: a checksummed write-ahead log with group commit. Nothing is
+  acknowledged before it is fsynced on a majority, the leader's own copy included.
+- **Linearizable reads on every node** via ReadIndex, without writing to the log
+  or waiting for any disk. `?stale=true` opts out.
+- **Exactly-once retries** per client session, and compare-and-set.
+- **Any node takes any request**; writes are forwarded to the leader.
+- `/status`, `/metrics` (Prometheus), `/healthz`, `/readyz`, graceful shutdown.
 
-## Key Features
+[docs/DESIGN.md](docs/DESIGN.md) explains the decisions and their limits;
+[docs/TESTING.md](docs/TESTING.md) explains how correctness is checked.
 
-- **Custom Raft Engine**: Full implementation of Leader Election, Log Replication, and Safety rules from the Raft paper.
-- **Leader Forwarding**: Write to ANY node — followers transparently proxy writes to the current leader.
-- **RPC Communication**: Uses standard Go `net/rpc` for inter-node `AppendEntries` and `RequestVote` calls.
-- **Persistence**: Raft state (CurrentTerm, VotedFor, Log) is persisted to disk to survive crashes.
-- **Consistent Reads**: Linearizable reads via `?consistent=true`.
-
-## Architecture
-
-Each node in the cluster runs two main components:
-1. **The Raft Engine (`raft/`)**: A pure Go implementation of the consensus algorithm. It manages the election timers, handles RPCs, and commits entries to the replicated log.
-2. **The KV Store (`store/`)**: An in-memory map that applies commands once the Raft engine confirms they have been committed by a majority of the cluster.
-
-Clients interact with the HTTP API, which translates REST calls into Raft log commands.
-
-## Quick Start
-
-### Build
+## Quick start
 
 ```bash
-go build -o raft-kv.exe .
+go build -o raft-kv.exe .        # drop .exe outside Windows
 ```
 
-### Run via Docker (Recommended)
-
-The easiest way to boot a fully functional 3-node cluster is using Docker Compose.
+Run each of these in its own terminal:
 
 ```bash
-cd docker
-docker-compose up -d --build
+./raft-kv.exe --node-id=n1 --http-addr=127.0.0.1:8001 --raft-addr=127.0.0.1:9001 --peers=n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 --peer-http=n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003
+./raft-kv.exe --node-id=n2 --http-addr=127.0.0.1:8002 --raft-addr=127.0.0.1:9002 --peers=n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 --peer-http=n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003
+./raft-kv.exe --node-id=n3 --http-addr=127.0.0.1:8003 --raft-addr=127.0.0.1:9003 --peers=n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003 --peer-http=n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003
 ```
-This provisions a persistent 3-node cluster exposed on HTTP ports `8001`, `8002`, and `8003`. 
-You can view the logs to see the election process:
-```bash
-docker-compose logs -f
-```
-
-### Start a 3-Node Cluster (Manually)
-
-Start 3 nodes in separate terminals. Because this is a static cluster, we pass all peer addresses on startup.
 
 ```bash
-# Terminal 1
-./raft-kv.exe --node-id=node1 --http-addr=:8001 --raft-addr=:9001 --peers=:9001,:9002,:9003 --peer-http=node1:8001,node2:8002,node3:8003
-
-# Terminal 2
-./raft-kv.exe --node-id=node2 --http-addr=:8002 --raft-addr=:9002 --peers=:9001,:9002,:9003 --peer-http=node1:8001,node2:8002,node3:8003
-
-# Terminal 3
-./raft-kv.exe --node-id=node3 --http-addr=:8003 --raft-addr=:9003 --peers=:9001,:9002,:9003 --peer-http=node1:8001,node2:8002,node3:8003
+curl -X PUT 127.0.0.1:8002/store/name -d '{"value": "raft"}'
+curl 127.0.0.1:8003/store/name
+curl -X DELETE 127.0.0.1:8001/store/name
+curl 127.0.0.1:8001/status
 ```
 
-Within 150-300ms, the nodes will hold an election, and one will become the leader.
+Kill the leader (`"is_leader":true` in `/status`) and repeat: the other two carry on.
 
-### Use It
+With Docker: `cd docker && docker compose up -d --build --wait`. The API is on
+ports 8001 to 8003 and each node's data is in its own volume.
 
-```bash
-# Write data (to any node — followers forward it to the leader)
-curl -X PUT localhost:8001/store/name -d '{"value": "IIT KGP"}'
+## API
 
-# Read data
-curl localhost:8002/store/name
-# → {"key":"name","value":"IIT KGP"}
+| Request | Meaning |
+|---|---|
+| `GET /store/{key}` | Linearizable read; `?stale=true` reads local state |
+| `PUT /store/{key}` `{"value":"..."}` | Write; `?if_version=N` makes it conditional (0 = must not exist) |
+| `DELETE /store/{key}` | Delete; also takes `if_version` |
+| `GET /store?prefix=&limit=` | Ordered scan |
+| `GET /cluster/members` | Membership |
+| `POST /cluster/members` `{"id","raft_addr","http_addr"}` | Add a learner (start it with `--join`) |
+| `POST /cluster/members/{id}/promote` | Make a caught-up learner a voter |
+| `DELETE /cluster/members/{id}` | Remove a member |
+| `POST /cluster/transfer?target=` | Hand over leadership |
 
-# Delete a key
-curl -X DELETE localhost:8001/store/name
-
-# Check node status
-curl localhost:8001/status
-```
-
-### Fault Tolerance Demo
-
-1. Write a key to the cluster.
-2. Look at the terminal logs to identify the Leader.
-3. Kill the Leader (Ctrl+C).
-4. Watch the logs of the remaining 2 nodes — they will detect the heartbeat timeout and elect a new leader.
-5. Read your key from a surviving node. It is still there!
+Errors say whether retrying is safe. **503** means nothing happened. **504
+`unknown_outcome`** means a write may or may not have taken effect: retry it with
+the same `X-Client-Id` and `X-Sequence-Num` and it runs at most once. **412** is a
+version mismatch and **409** a stale sequence number.
 
 ## Performance
 
-The project includes a load-testing benchmark script (`scripts/benchmark.go`) to measure the throughput and latency of the consensus engine under concurrent load. 
+Measured with `cmd/raft-bench` on one laptop (Ryzen 7 4800H, NVMe, Windows 11).
+All three nodes **and** the load generator share that machine and disk, so these
+are comparisons, not capacity figures. 100-byte values, 4–5 s rounds; the range is
+over rounds. No request failed.
 
-**Benchmark Conditions:**
-- 3-node local cluster
-- 10,000 sequential `PUT` requests
-- Concurrency: 100 workers
+| Workload | Workers | Requests/s | p50 ms | p99 ms |
+|---|---|---|---|---|
+| Write to leader | 1 | 131–165 | 5.9–6.0 | 11–38 |
+| Write to leader | 10 | 451–916 | 9.6–12 | 26–64 |
+| Write to leader | 50 | 2,900–3,353 | 11–12 | 43–79 |
+| Write to leader | 100 | 5,151–6,915 | 11–13 | 45–47 |
+| Write to leader | 200 | 10,568–13,783 | 12–13 | 44–66 |
+| Linearizable read, any node | 100 | 31,876–38,211 | 2.3–2.7 | 7.9–9.9 |
+| Stale read, any node | 100 | 59,413 | 1.2 | 7.9 |
 
-**Results:**
-- **Throughput**: ~138 Requests/sec
-- **p50 Latency**: ~2ms
-- **p95 Latency**: ~6ms
-- **p99 Latency**: ~19ms
+- The same disk does about **400 sequential write+fsync per second**. Group commit
+  is what lifts 200 workers to more than 25 times that.
+- One worker is slower than the raw disk because an acknowledgement needs fsyncs on
+  two nodes, which here contend for one drive.
+- Writing 1.08 million distinct keys, throughput per 15 s round stayed between
+  5,300 and 10,700/s (the first round was the slowest).
+- Failover, from `kill -9` of the leader to the first successful write on a
+  survivor: **0.79–1.28 s** over 15 trials (election timeout 500–1000 ms).
 
-## Tech Stack
+The same benchmark in Docker (Linux 5.15 under WSL2, same laptop, each node and the
+load generator in its own container). This disk does about 245 sequential
+write+fsync per second. No request failed.
 
-- **Go 1.24** — Language
-- **net/rpc** — Inter-node communication
-- **Standard Library** — No external dependencies used for consensus.
+| Workload | Workers | Requests/s | p50 ms | p99 ms |
+|---|---|---|---|---|
+| Write to leader | 1 | 107–122 | 8.1–8.5 | 11–40 |
+| Write to leader | 10 | 504–611 | 17–19 | 22–43 |
+| Write to leader | 50 | 2,027–2,566 | 19–24 | 29–38 |
+| Write to leader | 100 | 3,337–3,828 | 24–29 | 46–91 |
+| Write to leader | 200 | 3,077–6,349 | 28–50 | 80–416 |
+| Linearizable read, any node | 100 | 22,963–25,263 | 3.3–3.5 | 13–16 |
+
+In Docker, clients of a surviving node saw writes stop for 0.17–0.33 s when the leader
+got `SIGTERM` (it hands over first) and 1.6–1.7 s when it got `SIGKILL`. The latter is
+longer than on one host because a dead container's address does not refuse
+connections, so a forwarded write waits for the 1 s dial timeout.
+
+Reproduce with `go run ./cmd/raft-bench -leader -c 100 -urls http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003`
+and `go run ./cmd/raft-bench -fsync .`.
+
+## Limits
+
+- No TLS or authentication: run it on a trusted network.
+- All data must fit in memory, and a snapshot is built and sent from memory.
+- A node that loses its disk must **not** restart under its old ID, because it has
+  forgotten its votes. Remove it and join a new one.
+- One Raft group: no sharding, and no transactions beyond single-key compare-and-set.
+- Deduplication remembers the 100,000 most recently active clients.
 
 ## License
 
