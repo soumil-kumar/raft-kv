@@ -1,0 +1,55 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test . ./raft ./store ./httpd -count=1 -timeout 10m
+      - name: race detector
+        if: runner.os == 'Linux'
+        run: go test -race . ./raft ./store ./httpd -count=1 -timeout 15m
+      - name: end-to-end and linearizability
+        run: go test ./e2e -v -count=1 -timeout 10m
+        env: { E2E_SECONDS: "30" }
+
+  race-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: linearizability with race-built servers
+        run: go test ./e2e -run 'Linearizability' -v -count=1 -timeout 10m
+        env: { E2E_SECONDS: "60", E2E_RACE: "1" }
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: data survives recreating every container
+        run: |
+          cd docker
+          docker compose up -d --build --wait
+          curl -fsS -X PUT localhost:8002/store/k -d '{"value":"v"}'
+          curl -fsS -X PUT localhost:8003/store/k -d '{"value":"v"}'
+          docker compose down
+          docker compose up -d --wait
+          curl -fsS localhost:8001/store/k | grep '"value":"v"'
+          docker compose down -v
