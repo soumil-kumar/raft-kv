@@ -486,6 +486,21 @@ func (r *Raft) tickLoop() {
 
 func (r *Raft) tick(now time.Time) {
 	if r.role == Leader {
+		// Check-quorum: a leader cut off from its majority must stop accepting
+		// work it can never commit.
+		active := 0
+		for _, m := range r.conf().Members {
+			if m.Learner {
+				continue
+			}
+			if p := r.peers[m.ID]; m.ID == r.id || (p != nil && now.Sub(p.lastAck) < r.cfg.ElectionTimeout) {
+				active++
+			}
+		}
+		if active < r.conf().quorum() {
+			r.logger.Warn("lost contact with quorum", "term", r.term)
+			r.becomeFollower(r.term, "")
+		}
 		return
 	}
 	if now.After(r.electionDeadline) && r.conf().isVoter(r.id) {

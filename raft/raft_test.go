@@ -220,6 +220,29 @@ func TestPreVotePreventsTermInflation(t *testing.T) {
 	}
 }
 
+func TestIsolatedLeaderStepsDown(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	c.net.partition([]string{l.id}, c.others(l.id))
+	eventually(t, 2*time.Second, "check-quorum step down", func() bool { return !l.raft.IsLeader() })
+	if err := propose(l, "x", time.Second); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestLostLeadershipReportsUnknownOutcome(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.leader()
+	c.net.partition([]string{l.id}, c.others(l.id))
+	start := time.Now()
+	if err := propose(l, "x", 10*time.Second); !errors.Is(err, ErrLeadershipLost) {
+		t.Fatalf("got %v", err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("caller waited %v", d)
+	}
+}
+
 func TestMinorityCannotCommit(t *testing.T) {
 	c := newCluster(t, 5, nil)
 	l := c.leader()
