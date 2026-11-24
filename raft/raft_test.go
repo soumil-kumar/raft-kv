@@ -3,6 +3,8 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 )
@@ -237,4 +239,116 @@ func TestMinorityCannotCommit(t *testing.T) {
 	if got := c.converge(); fmt.Sprint(got) != "[kept]" {
 		t.Fatalf("got %v", got)
 	}
+}
+
+// TestChaos runs concurrent writers through random partitions, crashes with
+// unsynced data loss, message loss and delay, then checks that no acknowledged
+// write vanished or was applied out of agreement. Safety invariants are checked
+// on every apply and election throughout.
+func TestChaos(t *testing.T) {
+	seeds := 3
+	if testing.Short() {
+		seeds = 1
+	}
+	for s := range seeds {
+		for _, size := range []int{3, 5} {
+			t.Run(fmt.Sprintf("%d nodes/%d", size, s), func(t *testing.T) { chaos(t, size, 6*time.Second) })
+		}
+	}
+}
+
+func chaos(t *testing.T, size int, d time.Duration) {
+	c := newCluster(t, size, func(cfg *Config) {
+		cfg.SnapshotThreshold, cfg.TrailingLogs, cfg.SnapshotChunk = 60, 20, 1024
+	})
+	c.net.mu.Lock()
+	c.net.dropProb, c.net.maxDelay = 0.03, 4*time.Millisecond
+	c.net.mu.Unlock()
+
+	var nodesMu sync.RWMutex // guards node restarts against writers
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var ackMu sync.Mutex
+	acked := map[string]bool{}
+	for w := range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				cmd := fmt.Sprintf("w%d-%d", w, i)
+				nodesMu.RLock()
+				for _, n := range c.live() {
+					if n.raft.IsLeader() && propose(n, cmd, 300*time.Millisecond) == nil {
+						ackMu.Lock()
+						acked[cmd] = true
+						ackMu.Unlock()
+						break
+					}
+				}
+				nodesMu.RUnlock()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	all := ids(size)
+	for end := time.Now().Add(d); time.Now().Before(end); {
+		time.Sleep(time.Duration(100+rand.IntN(250)) * time.Millisecond)
+		nodesMu.Lock()
+		switch rand.IntN(4) {
+		case 0:
+			rand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+			k := 1 + rand.IntN(size-1)
+			c.net.partition(all[:k], all[k:])
+		case 1:
+			c.net.heal()
+		case 2: // crash anything from one node to the whole cluster
+			for _, n := range c.live() {
+				if rand.IntN(2) == 0 {
+					n.stall.Store(rand.IntN(2) == 0) // maybe mid-fsync
+					c.crash(n.id)
+					n.stall.Store(false)
+				}
+			}
+		case 3:
+			for _, id := range ids(size) {
+				if c.nodes[id].raft == nil {
+					c.start(id)
+				}
+			}
+		}
+		nodesMu.Unlock()
+	}
+	close(stop)
+	wg.Wait()
+	c.net.heal()
+	c.net.mu.Lock()
+	c.net.dropProb = 0
+	c.net.mu.Unlock()
+	for _, id := range ids(size) {
+		if c.nodes[id].raft == nil {
+			c.start(id)
+		}
+	}
+	c.write("final")
+	final := map[string]int{}
+	for _, cmd := range c.converge() {
+		final[cmd]++
+	}
+	for cmd := range acked {
+		if final[cmd] == 0 {
+			t.Errorf("acknowledged write %s was lost", cmd)
+		}
+	}
+	for cmd, n := range final {
+		if n > 1 && cmd != "final" {
+			t.Errorf("%s applied %d times", cmd, n)
+		}
+	}
+	t.Logf("%d acknowledged, %d applied, %d terms had leaders", len(acked), len(final), len(c.leaders))
 }
