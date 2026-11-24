@@ -163,7 +163,8 @@ func (r *Raft) HandleTimeoutNow(args *TimeoutNowArgs) (*TimeoutNowReply, error) 
 }
 
 // TransferLeadership hands leadership to the most up-to-date voter, or to
-// target if it is not empty, and waits until this node is no longer leader.
+// target if it is not empty, and waits until this node has heard from the new
+// leader, so that it can forward whatever it is still serving.
 func (r *Raft) TransferLeadership(ctx context.Context, target string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -210,6 +211,18 @@ func (r *Raft) TransferLeadership(ctx context.Context, target string) error {
 				defer cancel()
 				r.transport.TimeoutNow(c, m, args)
 			}()
+		}
+		r.readCond.Wait()
+	}
+	// Stepping down only means the target is campaigning; wait for it to win.
+	for r.leaderID == "" || r.leaderID == r.id {
+		switch {
+		case r.stopped:
+			return ErrStopped
+		case r.role == Leader:
+			return errors.New("raft: transfer failed, this node was elected again")
+		case ctx.Err() != nil:
+			return ctx.Err()
 		}
 		r.readCond.Wait()
 	}

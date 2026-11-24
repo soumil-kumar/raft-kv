@@ -273,7 +273,10 @@ func (r *Raft) followLeader(term uint64, leader string) {
 	if term > r.term || r.role != Follower {
 		r.becomeFollower(term, leader)
 	}
-	r.leaderID = leader
+	if r.leaderID != leader {
+		r.leaderID = leader
+		r.readCond.Broadcast() // a leadership transfer may be waiting
+	}
 	r.lastLeaderContact = time.Now()
 	r.resetElectionDeadline()
 }

@@ -505,6 +505,9 @@ func TestLeadershipTransfer(t *testing.T) {
 	if err := l.raft.TransferLeadership(ctx, target); err != nil {
 		t.Fatal(err)
 	}
+	if m, ok := l.raft.Leader(); !ok || m.ID != target {
+		t.Fatalf("transfer returned before the old leader heard from %s: %+v", target, m)
+	}
 	if got := c.leader().id; got != target {
 		t.Fatalf("leader is %s, want %s", got, target)
 	}
